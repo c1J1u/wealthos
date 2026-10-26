@@ -1,0 +1,24 @@
+{
+  "name": "wealthos",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Local-first personal finance with double-entry accounting",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "pnpm -C frontend dev",
+    "build": "pnpm -C frontend build",
+    "test": "pnpm -C frontend test",
+    "typecheck": "pnpm -C frontend typecheck",
+    "mock": "pnpm -C frontend mock",
+    "bootstrap": "pnpm -C backend bootstrap",
+    "test:backend": "pnpm -C backend test",
+    "check:public": "node scripts/check-public.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.64.1"
+  }
+}

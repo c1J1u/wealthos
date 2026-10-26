@@ -1,0 +1,35 @@
+{
+  "name": "@wealthos/backend",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "migrate": "tsx src/database/migrate-cli.ts up",
+    "migrate:status": "tsx src/database/migrate-cli.ts status",
+    "import:fixtures": "tsx src/scripts/import-fixtures.ts",
+    "bootstrap": "tsx src/scripts/bootstrap-ledger.ts"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.1.3",
+    "@fastify/static": "^10.1.7",
+    "fastify": "^5.2.0",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.4"
+  }
+}

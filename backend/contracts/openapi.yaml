@@ -1,0 +1,2569 @@
+openapi: 3.1.0
+info:
+  title: WealthOS Phase 1 API
+  version: 1.0.0
+  description: |
+    Local-first ledger API for WealthOS: read models, side-effect-free
+    transaction preview, idempotent transaction creation and reversal.
+    Account/liability administration, budgets, goals, forecasts and automation
+    are not exposed as write APIs in this release.
+
+    Conventions:
+    - money is an integer number of minor units (cents), never a float;
+    - ratios are decimals (0.318 = 31.8%);
+    - business dates are YYYY-MM-DD; audit timestamps are RFC3339;
+    - `null` means unknown; clients must render N/A, not zero;
+    - every response carries `meta.request_id`; transaction writes require
+      `Idempotency-Key`; preview is side-effect-free.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: http://127.0.0.1:8787/v1
+    description: Local loopback service
+security:
+  - sessionCookie: []
+  - bearerAuth: []
+tags:
+  - name: System
+  - name: Identity
+  - name: Accounts
+  - name: Transactions
+  - name: Reference
+  - name: Assets
+  - name: Investments
+  - name: Metrics
+  - name: Reports
+  - name: Governance
+x-phase: 1
+x-runtime: Fastify and local PostgreSQL
+x-out-of-scope:
+  - POST/PATCH /accounts (P3)
+  - budgets, goals, liabilities, fixed deposits, reviews, forecasts, automation
+  - MCP / Agent write operations
+x-phase-2-writes:
+  - POST /v1/transactions (2026-10-25: implemented; idempotent)
+  - POST /v1/transactions/{transaction_id}/void (2026-10-25: implemented)
+  - budgets, goals, liabilities, fixed deposits, reviews, forecasts, automation
+  - MCP / Agent write operations
+
+paths:
+  /auth/pair:
+    post:
+      tags: [Identity]
+      operationId: pairSession
+      summary: Exchange a one-time pairing code for a session (M2 hardening)
+      description: |
+        Only active when WEALTHOS_AUTH=pairing (required before any remote
+        exposure; local loopback mode uses the initialized book binding). The
+        one-time 8-digit code is printed in the server console on first
+        401 and expires after 5 minutes. The response carries a csrf_token
+        that every subsequent POST must echo in the X-CSRF-Token header.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  example: "82736451"
+      responses:
+        "200":
+          description: Paired; session cookie set
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [paired, csrf_token]
+                    properties:
+                      paired:
+                        type: boolean
+                      csrf_token:
+                        type: string
+                      expires_in:
+                        type: string
+                  meta:
+                    $ref: "#/components/schemas/ResponseMeta"
+        "401":
+          description: PAIRING_REQUIRED / PAIRING_WRONG / PAIRING_EXPIRED
+
+  /health:
+    get:
+      tags: [System]
+      operationId: getHealth
+      summary: Liveness/readiness probe
+      security: []
+      responses:
+        "200":
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, version]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok, degraded]
+                  version:
+                    type: string
+  /meta:
+    get:
+      tags: [System]
+      operationId: getMeta
+      summary: Server clock, timezone, capabilities and schema version
+      responses:
+        "200":
+          description: Server metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetaEnvelope"
+  /me:
+    get:
+      tags: [Identity]
+      operationId: getMe
+      summary: Current user, active book and scopes
+      responses:
+        "200":
+          description: Current identity
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /books:
+    get:
+      tags: [Identity]
+      operationId: listBooks
+      summary: Books visible to the current user
+      responses:
+        "200":
+          description: Book list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Book"
+                  meta:
+                    $ref: "#/components/schemas/ResponseMeta"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /bootstrap:
+    get:
+      tags: [System]
+      operationId: getBootstrap
+      summary: Consistent read-only snapshot for the Phase 1 frontend
+      description: |
+        Returns normalized Phase 1 entities only. Advanced domains (budgets,
+        goals, liabilities metadata, fixed deposits, reviews, forecasts,
+        automation) are intentionally absent; the frontend must keep those
+        pages in demo/empty state until their phase.
+      parameters:
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+        - name: include
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [phase1]
+            default: phase1
+      responses:
+        "200":
+          description: Bootstrap snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BootstrapEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /views/{page}:
+    get:
+      tags: [System]
+      operationId: getView
+      summary: Page read model for the Phase 1 page slice
+      parameters:
+        - name: page
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/Phase1Page"
+        - $ref: "#/components/parameters/AsOf"
+        - name: range
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [1m, 3m, 6m, 12m]
+            default: 3m
+        - name: period
+          in: query
+          required: false
+          description: |
+            Flow period for composition/stability/regularity/summary
+            (2026-10-26 ext). Combination semantics: period and as_of are
+            independent, but when exactly one is given the other derives
+            from it — only period -> as_of = that month's end; only as_of
+            -> period = that month. Neither -> book default period (U-2)
+            and real today. Historical periods are served with the same
+            semantics as the default period — no client-side substitution.
+          schema:
+            type: string
+            pattern: "^[0-9]{4}-(0[1-9]|1[0-2])$"
+        - name: type
+          in: query
+          required: false
+          description: "transactions page only: same semantics as GET /transactions."
+          schema:
+            $ref: "#/components/schemas/TransactionType"
+        - name: status
+          in: query
+          required: false
+          description: "transactions page only."
+          schema:
+            $ref: "#/components/schemas/TransactionDisplayStatus"
+        - name: account_id
+          in: query
+          required: false
+          description: "transactions page only."
+          schema:
+            type: string
+            format: uuid
+        - name: category_code
+          in: query
+          required: false
+          description: "transactions page only."
+          schema:
+            type: string
+        - name: q
+          in: query
+          required: false
+          description: "transactions page only: merchant/description search."
+          schema:
+            type: string
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+        - name: reconciliation
+          in: query
+          required: false
+          description: "transactions page only."
+          schema:
+            $ref: "#/components/schemas/ReconciliationStatus"
+        - name: data_state
+          in: query
+          required: false
+          description: "transactions page only."
+          schema:
+            type: string
+            enum: [ACTUAL, ESTIMATE]
+      responses:
+        "200":
+          description: Page read model
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ViewEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /accounts:
+    get:
+      tags: [Accounts]
+      operationId: listAccounts
+      summary: List accounts with derived balances
+      parameters:
+        - $ref: "#/components/parameters/AsOf"
+        - name: include_archived
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Account page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountListEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /accounts/{account_id}:
+    get:
+      tags: [Accounts]
+      operationId: getAccount
+      summary: Account details
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+      responses:
+        "200":
+          description: Account
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /accounts/{account_id}/balance:
+    get:
+      tags: [Accounts]
+      operationId: getAccountBalance
+      summary: Derived balance, available balance and frozen amount
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "#/components/parameters/AsOf"
+      responses:
+        "200":
+          description: Account balance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountBalanceEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /accounts/{account_id}/entries:
+    get:
+      tags: [Accounts]
+      operationId: listAccountEntries
+      summary: Ledger entries affecting an account
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Entry page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntryListEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /transactions:
+    post:
+      tags: [Transactions]
+      operationId: createTransaction
+      summary: Record a manual transaction (P2 write, idempotent)
+      description: |
+        Single-transaction command: validation, entry vector (standard
+        templates), business rows, audit (hash-chained), outbox and the
+        idempotency result are committed atomically. Requires the
+        Idempotency-Key header (FI-11): same key + same body replays the
+        first response; same key + different body is a 409.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTransactionRequest"
+      responses:
+        "201":
+          description: Created (or idempotent replay; header idempotency-replayed=true)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommandResultEnvelope"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "409":
+          description: Idempotency conflict (IDEMPOTENCY_CONFLICT / IDEMPOTENCY_IN_PROGRESS)
+        "422":
+          description: PERIOD_CLOSED or SPLIT_MISMATCH
+    get:
+      tags: [Transactions]
+      operationId: listTransactions
+      summary: List transactions
+      parameters:
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+        - name: type
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/TransactionType"
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/TransactionDisplayStatus"
+        - name: account_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - name: category_code
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: reconciliation
+          in: query
+          required: false
+          description: Filter by reconciliation status (frontend-proposed, adopted 2026-10-25).
+          schema:
+            $ref: "#/components/schemas/ReconciliationStatus"
+        - name: data_state
+          in: query
+          required: false
+          description: Filter by data state; ACTUAL or ESTIMATE only.
+          schema:
+            type: string
+            enum: [ACTUAL, ESTIMATE]
+        - name: q
+          in: query
+          required: false
+          description: Merchant/description search (Phase 1 read-only)
+          schema:
+            type: string
+            maxLength: 120
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Transaction page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionListEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /transactions/{transaction_id}/void:
+    post:
+      tags: [Transactions]
+      operationId: voidTransaction
+      summary: Void a transaction via reversal (ADR-204)
+      description: |
+        Creates a reversal transaction with mirrored entries; the original
+        stays stored-POSTED and derives status VOIDED. Voiding a reversal
+        is rejected (B-21). Posting period of the reversal date must be open.
+      parameters:
+        - name: transaction_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+                reversal_date:
+                  type: string
+                  format: date
+                  description: Defaults to today.
+      responses:
+        "201":
+          description: Reversal created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommandResultEnvelope"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          description: ALREADY_VOIDED / NOT_VOIDABLE / PERIOD_CLOSED
+
+  /transactions/{transaction_id}:
+    get:
+      tags: [Transactions]
+      operationId: getTransaction
+      summary: Transaction with entries and links
+      parameters:
+        - $ref: "#/components/parameters/TransactionId"
+      responses:
+        "200":
+          description: Transaction
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /transactions/{transaction_id}/entries:
+    get:
+      tags: [Transactions]
+      operationId: listTransactionEntries
+      summary: Entries of one transaction
+      parameters:
+        - $ref: "#/components/parameters/TransactionId"
+      responses:
+        "200":
+          description: Entry list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntryListEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /transactions/preview:
+    post:
+      tags: [Transactions]
+      operationId: previewTransaction
+      summary: Build balanced entries without posting
+      description: |
+        Side-effect-free. The server selects the posting template from
+        `transaction_type` and metadata, validates splits, and returns entries.
+        Clients must not submit entries, flow_effect, direction or balances.
+        This endpoint is safe to call repeatedly; it does not require an
+        Idempotency-Key and writes nothing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TransactionPreviewRequest"
+      responses:
+        "200":
+          description: Preview result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TransactionPreviewEnvelope"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+  /categories:
+    get:
+      tags: [Reference]
+      operationId: listCategories
+      summary: Category tree (flat list with parent_code)
+      parameters:
+        - name: kind
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [INCOME, EXPENSE]
+        - name: include_archived
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Category list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Category"
+                  meta:
+                    $ref: "#/components/schemas/ResponseMeta"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /assets:
+    get:
+      tags: [Assets]
+      operationId: listAssets
+      summary: Non-account assets with latest valuation
+      parameters:
+        - $ref: "#/components/parameters/AsOf"
+      responses:
+        "200":
+          description: Asset list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Asset"
+                  meta:
+                    $ref: "#/components/schemas/ResponseMeta"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /assets/{asset_id}/valuations:
+    get:
+      tags: [Assets]
+      operationId: listAssetValuations
+      summary: Valuation history for an asset
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/AsOf"
+      responses:
+        "200":
+          description: Valuation list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AssetValuation"
+                  meta:
+                    $ref: "#/components/schemas/ResponseMeta"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /instruments:
+    get:
+      tags: [Investments]
+      operationId: listInstruments
+      summary: Instrument master data
+      responses:
+        "200":
+          description: Instrument list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Instrument"
+                  meta:
+                    $ref: "#/components/schemas/ResponseMeta"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /positions:
+    get:
+      tags: [Investments]
+      operationId: listPositions
+      summary: Positions with latest price and market value
+      parameters:
+        - $ref: "#/components/parameters/AsOf"
+      responses:
+        "200":
+          description: Position list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Position"
+                  meta:
+                    $ref: "#/components/schemas/ResponseMeta"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /portfolio:
+    get:
+      tags: [Investments]
+      operationId: getPortfolio
+      summary: Portfolio aggregate (market value, cost, P&L, allocation)
+      parameters:
+        - $ref: "#/components/parameters/AsOf"
+      responses:
+        "200":
+          description: Portfolio
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PortfolioEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /metrics:
+    get:
+      tags: [Metrics]
+      operationId: getMetrics
+      summary: Batch metric values
+      parameters:
+        - name: ids
+          in: query
+          required: false
+          description: |
+            Comma-separated metric ids. Omitted = the full catalog
+            (2026-10-25: made optional so a bare catalog call returns all).
+          schema:
+            type: string
+            example: net_worth,total_assets,monthly_total_expense
+        - $ref: "#/components/parameters/AsOf"
+        - $ref: "#/components/parameters/Period"
+        - $ref: "#/components/parameters/DataState"
+        - name: include_estimate
+          in: query
+          required: false
+          description: Balance-sheet metrics include ESTIMATE only when explicitly true; default false for flow metrics, true for balance-sheet metrics.
+          schema:
+            type: boolean
+      responses:
+        "200":
+          description: Metric bundle
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetricBundleEnvelope"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /metrics/{metric_id}:
+    get:
+      tags: [Metrics]
+      operationId: getMetric
+      summary: Single metric with formula metadata
+      parameters:
+        - name: metric_id
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/MetricId"
+        - $ref: "#/components/parameters/AsOf"
+        - $ref: "#/components/parameters/Period"
+        - $ref: "#/components/parameters/DataState"
+      responses:
+        "200":
+          description: Metric result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetricEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /analytics/series:
+    get:
+      tags: [Metrics]
+      operationId: getSeries
+      summary: Time series for a metric
+      parameters:
+        - name: metric
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/MetricId"
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+        - name: granularity
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [day, week, month, quarter, year]
+            default: month
+        - $ref: "#/components/parameters/DataState"
+      responses:
+        "200":
+          description: Metric series
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SeriesEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /reports/balance-sheet:
+    get:
+      tags: [Reports]
+      operationId: getBalanceSheet
+      summary: Balance sheet as of a date
+      parameters:
+        - $ref: "#/components/parameters/AsOf"
+      responses:
+        "200":
+          description: Balance sheet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BalanceSheetEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /reports/income-statement:
+    get:
+      tags: [Reports]
+      operationId: getIncomeStatement
+      summary: Income statement for a period
+      parameters:
+        - $ref: "#/components/parameters/Period"
+      responses:
+        "200":
+          description: Income statement
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IncomeStatementEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /reports/cash-flow:
+    get:
+      tags: [Reports]
+      operationId: getCashFlow
+      summary: Cash-flow statement for a period
+      parameters:
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+        - name: account_id
+          in: query
+          required: false
+          description: |
+            Restrict the cash-flow basis to one cash-equivalent account
+            (2026-10-25 ext). Omitted = consolidated book basis.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Cash-flow statement
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CashFlowEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /snapshots:
+    get:
+      tags: [Reports]
+      operationId: listSnapshots
+      summary: Computed financial snapshots
+      parameters:
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+      responses:
+        "200":
+          description: Snapshot list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/FinancialSnapshot"
+                  meta:
+                    $ref: "#/components/schemas/ResponseMeta"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /data-quality:
+    get:
+      tags: [Governance]
+      operationId: getDataQuality
+      summary: Data-quality checks and fixture normalization status
+      responses:
+        "200":
+          description: Data-quality report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DataQualityEnvelope"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /audit-logs:
+    get:
+      tags: [Governance]
+      operationId: listAuditLogs
+      summary: Append-only audit log (read-only)
+      parameters:
+        - $ref: "#/components/parameters/FromDate"
+        - $ref: "#/components/parameters/ToDate"
+        - name: entity_type
+          in: query
+          required: false
+          schema:
+            type: string
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Audit log page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/AuditLog"
+                  meta:
+                    $ref: "#/components/schemas/ResponseMeta"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: wealthos_session
+      description: HttpOnly, Secure, SameSite session cookie issued by the OIDC flow.
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Short-lived Agent/API token; scoped and audited.
+
+  parameters:
+    AsOf:
+      name: as_of
+      in: query
+      required: false
+      description: |
+        Business date cutoff (posting_date <= as_of). Defaults to the
+        server's current business date. On period-scoped endpoints
+        (metrics, views), when as_of is given without period, the period
+        derives from the as_of month (and vice versa).
+      schema:
+        type: string
+        format: date
+    FromDate:
+      name: from
+      in: query
+      required: false
+      schema:
+        type: string
+        format: date
+    ToDate:
+      name: to
+      in: query
+      required: false
+      schema:
+        type: string
+        format: date
+    Period:
+      name: period
+      in: query
+      required: false
+      description: Reporting period in YYYY-MM (Phase 1) or a supported period token.
+      schema:
+        type: string
+        pattern: "^[0-9]{4}-(0[1-9]|1[0-2])$"
+        example: "2025-06"
+    DataState:
+      name: data_state
+      in: query
+      required: false
+      schema:
+        $ref: "#/components/schemas/DataState"
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor returned by the previous page.
+      schema:
+        type: string
+    AccountId:
+      name: account_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    TransactionId:
+      name: transaction_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    Unauthorized:
+      description: Missing or expired session/token
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+          example:
+            type: "https://wealthos.example/problems/unauthenticated"
+            title: "Unauthenticated"
+            status: 401
+            code: "UNAUTHENTICATED"
+            detail: "A valid session or bearer token is required."
+            request_id: "req_example"
+    Forbidden:
+      description: Authenticated but not permitted
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    NotFound:
+      description: Resource not found in the current book
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    ValidationError:
+      description: Request validation failed
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+    Unprocessable:
+      description: Semantically invalid financial operation (unbalanced, split mismatch, closed period)
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+  schemas:
+    # ---------------------------------------------------------------------
+    # Enums
+    # ---------------------------------------------------------------------
+    DataState:
+      type: string
+      enum: [ACTUAL, ESTIMATE, BUDGET, FORECAST, SCENARIO]
+    LedgerDataState:
+      type: string
+      enum: [ACTUAL, ESTIMATE]
+    TransactionType:
+      type: string
+      enum:
+        - INCOME
+        - EXPENSE
+        - TRANSFER
+        - CREDIT_CARD_PURCHASE
+        - CREDIT_CARD_REPAYMENT
+        - LOAN_DISBURSEMENT
+        - LOAN_REPAYMENT
+        - DEPOSIT_OPEN
+        - DEPOSIT_MATURITY
+        - DEPOSIT_RENEWAL
+        - INVESTMENT_BUY
+        - INVESTMENT_SELL
+        - DIVIDEND_RECEIVED
+        - INTEREST_RECEIVED
+        - FEE_CHARGED
+        - REFUND
+        - REIMBURSEMENT
+        - ASSET_REVALUATION
+        - LIABILITY_ADJUSTMENT
+        - CURRENCY_EXCHANGE
+        - OTHER_ADJUSTMENT
+    ReconciliationStatus:
+      type: string
+      enum: [UNRECONCILED, MATCHED, NEEDS_REVIEW]
+    TransactionDisplayStatus:
+      type: string
+      enum: [DRAFT, PENDING, POSTED, RECONCILED, VOIDED]
+      description: VOIDED is derived from voided_by_transaction_id; it is not a stored ledger status.
+    TransactionStatus:
+      type: string
+      enum: [DRAFT, PENDING, POSTED, RECONCILED]
+    Direction:
+      type: string
+      enum: [DEBIT, CREDIT]
+    EntryRole:
+      type: string
+      enum: [PRIMARY, FUNDING, MEMO]
+    ExpenseBucket:
+      type: string
+      enum: [ESSENTIAL, DISCRETIONARY, FINANCIAL_COST, REFUND_REVERSAL]
+    FlowEffectCode:
+      type: string
+      enum:
+        - INCOME_SALARY
+        - INCOME_OTHER
+        - INCOME_PASSIVE
+        - INCOME_REALIZED_GAIN
+        - TRANSFER_INTERNAL
+        - ASSET_EXCHANGE
+        - DEBT_BORROW
+        - DEBT_PRINCIPAL_REPAY
+        - DEBT_INTEREST
+        - DEBT_FEE
+        - CONSUMPTION
+        - CONSUMPTION_PF_RENT
+        - REFUND_REVERSAL
+        - REIMBURSEMENT_RECEIPT
+        - RECEIVABLE_SETTLEMENT
+        - PROVIDENT_FUND_EMPLOYEE
+        - PROVIDENT_FUND_EMPLOYER
+        - ASSET_REVALUATION
+        - LIABILITY_ADJUSTMENT
+        - OTHER_ADJUSTMENT
+    NormalSide:
+      type: string
+      enum: [ASSET, LIABILITY]
+    AccountStatus:
+      type: string
+      enum: [ACTIVE, FROZEN, CLOSED]
+    LiquidityLevel:
+      type: string
+      enum: [INSTANT, HIGH, TERM, LOW, ILLIQUID]
+    MetricId:
+      type: string
+      enum:
+        - total_assets
+        - total_liabilities
+        - net_worth
+        - cash_reserve
+        - liquid_assets
+        - monthly_total_income
+        - monthly_total_expense
+        - essential_expense
+        - discretionary_expense
+        - financial_cost
+        - refund_reversal
+        - debt_service_to_income
+        - savings_rate
+        - savings_rate_incl_debt_principal
+        - net_worth_change
+        - financial_runway_months
+    Phase1Page:
+      type: string
+      enum: [overview, transactions, accounts, income, expenses, cashflow, assets, investments, reports, analytics, settings]
+    MetricUnit:
+      type: string
+      enum: [CNY, RATIO, COUNT, MONTHS]
+
+    # ---------------------------------------------------------------------
+    # Common
+    # ---------------------------------------------------------------------
+    ResponseMeta:
+      type: object
+      required: [request_id]
+      properties:
+        request_id:
+          type: string
+        as_of:
+          type: string
+          format: date
+        period:
+          type: string
+          pattern: "^[0-9]{4}-(0[1-9]|1[0-2])$"
+          description: |
+            The flow period actually used for the response (2026-10-26 ext).
+            Echoed by period-scoped endpoints (views, metrics, reports).
+        data_state:
+          $ref: "#/components/schemas/DataState"
+        partial:
+          type: boolean
+        missing_count:
+          type: integer
+          minimum: 0
+        next_cursor:
+          type: [string, "null"]
+        version:
+          type: integer
+    Problem:
+      type: object
+      required: [type, title, status, code, request_id]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        code:
+          type: string
+          enum:
+            - VALIDATION_FAILED
+            - UNAUTHENTICATED
+            - FORBIDDEN
+            - SCOPE_INSUFFICIENT
+            - NOT_FOUND
+            - VERSION_CONFLICT
+            - IDEMPOTENCY_KEY_REUSED
+            - DUPLICATE_TRANSACTION
+            - LEDGER_UNBALANCED
+            - SPLIT_MISMATCH
+            - PERIOD_CLOSED
+            - INSUFFICIENT_FUNDS
+            - IMMUTABLE_ENTRY
+            - ACCOUNT_LOCKED
+            - AGENT_APPROVAL_REQUIRED
+            - RATE_LIMITED
+            - INTERNAL
+        detail:
+          type: string
+        request_id:
+          type: string
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field:
+                type: string
+              code:
+                type: string
+              message:
+                type: string
+    MoneyField:
+      type: integer
+      format: int64
+      minimum: 0
+      maximum: 100000000000
+      description: Integer minor units (cents). Never a float.
+    RatioField:
+      type: number
+      format: double
+      description: Decimal ratio (0.318 = 31.8%); null when the denominator is zero/missing.
+
+    # ---------------------------------------------------------------------
+    # System / identity
+    # ---------------------------------------------------------------------
+    Meta:
+      type: object
+      required: [server_time, timezone, base_currency, schema_version, min_client_version, today, current_period]
+      properties:
+        server_time:
+          type: string
+          format: date-time
+        timezone:
+          type: string
+          example: Asia/Shanghai
+        base_currency:
+          type: string
+          example: CNY
+        schema_version:
+          type: string
+          example: "1.0"
+        min_client_version:
+          type: string
+          example: "1.0.0"
+        today:
+          type: string
+          format: date
+        current_period:
+          type: string
+          pattern: "^[0-9]{4}-(0[1-9]|1[0-2])$"
+        book_period:
+          type: string
+          pattern: "^[0-9]{4}-(0[1-9]|1[0-2])$"
+          description: |
+            Default business period for the current book (2026-10-26 ext):
+            the latest month with posted transactions, falling back to the
+            current calendar month. Period-scoped queries use this when
+            `period` is omitted; `today`/`current_period` stay real.
+        capabilities:
+          type: array
+          items:
+            type: string
+          example: [ledger.read, metrics.read, reports.read, transactions.preview]
+    MetaEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/Meta"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    Me:
+      type: object
+      required: [user_id, display_name, book_id, book_name, roles, scopes]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+        book_id:
+          type: string
+          format: uuid
+        book_name:
+          type: string
+        roles:
+          type: array
+          items:
+            type: string
+        scopes:
+          type: array
+          items:
+            type: string
+    MeEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/Me"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    Book:
+      type: object
+      required: [book_id, name, base_currency, status]
+      properties:
+        book_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        base_currency:
+          type: string
+        fiscal_start_month:
+          type: integer
+          minimum: 1
+          maximum: 12
+        status:
+          type: string
+          enum: [ACTIVE, ARCHIVED]
+
+    # ---------------------------------------------------------------------
+    # Accounts
+    # ---------------------------------------------------------------------
+    Account:
+      type: object
+      required: [account_id, name, type, subtype, normal_side, balance_cents, data_state, version]
+      properties:
+        account_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        type:
+          type: string
+          enum: [CASH, BANK, PAYMENT, CREDIT, INVESTMENT, HOUSING, PROTECTION, OTHER]
+        subtype:
+          type: string
+        institution_name:
+          type: [string, "null"]
+        currency:
+          type: string
+        normal_side:
+          $ref: "#/components/schemas/NormalSide"
+        include_in_net_worth:
+          type: boolean
+        is_restricted:
+          type: boolean
+        liquidity_level:
+          $ref: "#/components/schemas/LiquidityLevel"
+        status:
+          $ref: "#/components/schemas/AccountStatus"
+        balance_cents:
+          $ref: "#/components/schemas/MoneyField"
+        available_balance_cents:
+          type: [integer, "null"]
+          format: int64
+        frozen_amount_cents:
+          type: integer
+          format: int64
+        data_state:
+          $ref: "#/components/schemas/LedgerDataState"
+        version:
+          type: integer
+        updated_at:
+          type: string
+          format: date-time
+    AccountEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/Account"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    AccountListEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Account"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    AccountBalance:
+      type: object
+      required: [account_id, as_of, debit_total_cents, credit_total_cents, balance_cents, normal_side]
+      properties:
+        account_id:
+          type: string
+          format: uuid
+        as_of:
+          type: string
+          format: date
+        debit_total_cents:
+          type: integer
+          format: int64
+        credit_total_cents:
+          type: integer
+          format: int64
+        balance_cents:
+          type: integer
+          format: int64
+        normal_side:
+          $ref: "#/components/schemas/NormalSide"
+        available_balance_cents:
+          type: [integer, "null"]
+          format: int64
+        frozen_amount_cents:
+          type: integer
+          format: int64
+        computed:
+          type: boolean
+          description: True when the value was recomputed from entries rather than the cache.
+    AccountBalanceEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/AccountBalance"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+
+    # ---------------------------------------------------------------------
+    # Transactions / entries
+    # ---------------------------------------------------------------------
+    TransactionEntry:
+      type: object
+      required: [entry_id, transaction_id, line_no, direction, amount_cents, ledger_account_id, ledger_account_code, flow_effect, entry_role]
+      properties:
+        entry_id:
+          type: string
+          format: uuid
+        transaction_id:
+          type: string
+          format: uuid
+        line_no:
+          type: integer
+        direction:
+          $ref: "#/components/schemas/Direction"
+        amount_cents:
+          $ref: "#/components/schemas/MoneyField"
+        ledger_account_id:
+          type: string
+          format: uuid
+        ledger_account_code:
+          type: string
+          example: "EXPENSE:FOOD_DELIVERY"
+        account_id:
+          type: [string, "null"]
+          format: uuid
+        flow_effect:
+          $ref: "#/components/schemas/FlowEffectCode"
+        entry_role:
+          $ref: "#/components/schemas/EntryRole"
+        expense_bucket:
+          oneOf:
+            - $ref: "#/components/schemas/ExpenseBucket"
+            - type: "null"
+        principal_cents:
+          type: [integer, "null"]
+          format: int64
+        gain_cents:
+          type: [integer, "null"]
+          format: int64
+        memo:
+          type: [string, "null"]
+        currency:
+          type: string
+          example: CNY
+        base_amount_cents:
+          type: [integer, "null"]
+          format: int64
+    CreateTransactionRequest:
+      type: object
+      required: [transaction_type, amount_cents, transaction_date]
+      properties:
+        transaction_type:
+          $ref: "#/components/schemas/TransactionType"
+        amount_cents:
+          $ref: "#/components/schemas/MoneyField"
+        transaction_date:
+          type: string
+          format: date
+        posting_date:
+          type: string
+          format: date
+        source_account_id:
+          type: [string, "null"]
+          format: uuid
+        destination_account_id:
+          type: [string, "null"]
+          format: uuid
+          description: |
+            Arrival account for INCOME/REFUND (normalized N-01 form) and the
+            liability account for repayments; card account for
+            CREDIT_CARD_PURCHASE may be supplied via credit_account_id instead.
+        credit_account_id:
+          type: [string, "null"]
+          format: uuid
+        category_code:
+          type: [string, "null"]
+        merchant_name:
+          type: [string, "null"]
+        description:
+          type: [string, "null"]
+        data_state:
+          type: string
+          enum: [ACTUAL, ESTIMATE]
+        related_transaction_id:
+          type: [string, "null"]
+          format: uuid
+        repayment:
+          type: ["null", object]
+          description: Required for LOAN_REPAYMENT / CREDIT_CARD_REPAYMENT.
+          properties:
+            principal_cents:
+              type: integer
+              format: int64
+            interest_cents:
+              type: integer
+              format: int64
+            fees_cents:
+              type: integer
+              format: int64
+        expense_meta:
+          type: ["null", object]
+          properties:
+            necessity_level:
+              type: string
+              enum: [ESSENTIAL, OPTIONAL, LUXURY]
+        is_recurring:
+          type: boolean
+        frequency_type:
+          type: [string, "null"]
+          enum: [ONE_OFF, RECURRING, MONTHLY, WEEKLY, QUARTERLY, YEARLY, IRREGULAR, null]
+        reimbursable:
+          type: boolean
+    CommandResult:
+      type: object
+      required: [transaction_id, replayed]
+      properties:
+        transaction_id:
+          type: string
+          format: uuid
+        replayed:
+          type: boolean
+    CommandResultEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/CommandResult"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    Transaction:
+      type: object
+      required: [transaction_id, transaction_type, amount_cents, currency, transaction_date, posting_date, status, data_state, version, entries]
+      # display_effect (2026-10-25 ext): server-side INFLOW/OUTFLOW/NEUTRAL
+      # by transaction_type, versioned; not a cash-perspective direction.
+      properties:
+        display_effect:
+          type: [string, "null"]
+          enum: [INFLOW, OUTFLOW, NEUTRAL, null]
+        display_effect_version:
+          type: [string, "null"]
+        transaction_id:
+          type: string
+          format: uuid
+        transaction_type:
+          $ref: "#/components/schemas/TransactionType"
+        amount_cents:
+          $ref: "#/components/schemas/MoneyField"
+        currency:
+          type: string
+        transaction_date:
+          type: string
+          format: date
+        posting_date:
+          type: string
+          format: date
+        status:
+          $ref: "#/components/schemas/TransactionDisplayStatus"
+        reconciliation_status:
+          type: string
+          enum: [UNRECONCILED, MATCHED, NEEDS_REVIEW]
+        source_account_id:
+          type: [string, "null"]
+          format: uuid
+        destination_account_id:
+          type: [string, "null"]
+          format: uuid
+        credit_account_id:
+          type: [string, "null"]
+          format: uuid
+        category_code:
+          type: [string, "null"]
+        merchant_name:
+          type: [string, "null"]
+        description:
+          type: [string, "null"]
+        data_state:
+          $ref: "#/components/schemas/LedgerDataState"
+        source_type:
+          type: string
+          enum: [MANUAL, FILE_IMPORT, BANK_API, CONNECTOR, AI_AGENT]
+        external_transaction_id:
+          type: [string, "null"]
+        validation_status:
+          type: string
+          enum: [UNVERIFIED, VERIFIED, DISPUTED, CORRECTED]
+        related_transaction_id:
+          type: [string, "null"]
+          format: uuid
+        voided_by_transaction_id:
+          type: [string, "null"]
+          format: uuid
+        version:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/TransactionEntry"
+    TransactionEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/Transaction"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    TransactionListEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Transaction"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    EntryListEnvelope:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/TransactionEntry"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    ExpenseMetaInput:
+      type: object
+      additionalProperties: false
+      properties:
+        necessity_level:
+          type: string
+          enum: [ESSENTIAL, OPTIONAL, LUXURY]
+        expense_nature:
+          type: string
+          enum: [FIXED, VARIABLE]
+        consumption_scene:
+          type: string
+          enum: [WORK, PERSONAL, FAMILY]
+        payment_method:
+          type: string
+          enum: [BANK, CREDIT_CARD, WALLET, PROVIDENT_FUND]
+        reimbursable:
+          type: boolean
+    RepaymentMetaInput:
+      type: object
+      additionalProperties: false
+      required: [principal_cents, interest_cents, fees_cents]
+      properties:
+        principal_cents:
+          type: integer
+          format: int64
+          minimum: 0
+        interest_cents:
+          type: integer
+          format: int64
+          minimum: 0
+        fees_cents:
+          type: integer
+          format: int64
+          minimum: 0
+    TransactionPreviewRequest:
+      type: object
+      additionalProperties: false
+      required: [transaction_type, amount_cents, currency, transaction_date]
+      properties:
+        transaction_type:
+          $ref: "#/components/schemas/TransactionType"
+        amount_cents:
+          $ref: "#/components/schemas/MoneyField"
+        currency:
+          type: string
+          example: CNY
+        transaction_date:
+          type: string
+          format: date
+        posting_date:
+          type: [string, "null"]
+          format: date
+        source_account_id:
+          type: [string, "null"]
+          format: uuid
+        destination_account_id:
+          type: [string, "null"]
+          format: uuid
+        credit_account_id:
+          type: [string, "null"]
+          format: uuid
+        category_code:
+          type: [string, "null"]
+        merchant_name:
+          type: [string, "null"]
+          maxLength: 200
+        description:
+          type: [string, "null"]
+          maxLength: 500
+        expense_meta:
+          oneOf:
+            - $ref: "#/components/schemas/ExpenseMetaInput"
+            - type: "null"
+        repayment_meta:
+          oneOf:
+            - $ref: "#/components/schemas/RepaymentMetaInput"
+            - type: "null"
+        cost_basis_cents:
+          type: [integer, "null"]
+          format: int64
+          minimum: 0
+        gain_cents:
+          type: [integer, "null"]
+          format: int64
+          minimum: 0
+        data_state:
+          $ref: "#/components/schemas/LedgerDataState"
+    TransactionPreview:
+      type: object
+      required: [transaction_type, amount_cents, balanced, entries]
+      properties:
+        transaction_type:
+          $ref: "#/components/schemas/TransactionType"
+        amount_cents:
+          $ref: "#/components/schemas/MoneyField"
+        balanced:
+          type: boolean
+        debit_total_cents:
+          type: integer
+          format: int64
+        credit_total_cents:
+          type: integer
+          format: int64
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/TransactionEntry"
+        warnings:
+          type: array
+          items:
+            type: string
+    TransactionPreviewEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/TransactionPreview"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+
+    # ---------------------------------------------------------------------
+    # Reference / assets / investments
+    # ---------------------------------------------------------------------
+    Category:
+      type: object
+      required: [category_code, name_zh, kind]
+      properties:
+        category_code:
+          type: string
+        parent_code:
+          type: [string, "null"]
+        name_zh:
+          type: string
+        name_en:
+          type: [string, "null"]
+        kind:
+          type: string
+          enum: [INCOME, EXPENSE]
+        default_necessity:
+          type: [string, "null"]
+          enum: [ESSENTIAL, OPTIONAL, LUXURY, null]
+    Asset:
+      type: object
+      required: [asset_id, name, asset_type, latest_market_value_cents, valuation_date, liquidity_level]
+      properties:
+        asset_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        asset_type:
+          type: string
+        account_id:
+          type: [string, "null"]
+          format: uuid
+        currency:
+          type: string
+        is_restricted:
+          type: boolean
+        liquidity_level:
+          $ref: "#/components/schemas/LiquidityLevel"
+        latest_market_value_cents:
+          $ref: "#/components/schemas/MoneyField"
+        valuation_date:
+          type: [string, "null"]
+          format: date
+        valuation_source:
+          type: [string, "null"]
+        data_state:
+          $ref: "#/components/schemas/LedgerDataState"
+    AssetValuation:
+      type: object
+      required: [valuation_id, asset_id, as_of, market_value_cents, source]
+      properties:
+        valuation_id:
+          type: string
+          format: uuid
+        asset_id:
+          type: string
+          format: uuid
+        as_of:
+          type: string
+          format: date
+        market_value_cents:
+          $ref: "#/components/schemas/MoneyField"
+        cost_basis_cents:
+          type: [integer, "null"]
+          format: int64
+        unrealized_gain_loss_cents:
+          type: [integer, "null"]
+          format: int64
+        source:
+          type: string
+          enum: [ACCOUNT_STATEMENT, MARKET_PRICE, USER_ESTIMATE, APPRAISAL]
+    Instrument:
+      type: object
+      required: [instrument_id, ticker, name, asset_class, currency]
+      properties:
+        instrument_id:
+          type: string
+          format: uuid
+        ticker:
+          type: string
+        name:
+          type: string
+        asset_class:
+          type: string
+        currency:
+          type: string
+        risk_level:
+          type: string
+          enum: [LOW, MEDIUM, HIGH]
+    Position:
+      type: object
+      required: [position_id, instrument_id, account_id, quantity, average_cost_cents, market_value_cents]
+      properties:
+        position_id:
+          type: string
+          format: uuid
+        instrument_id:
+          type: string
+          format: uuid
+        instrument_name:
+          type: string
+        account_id:
+          type: string
+          format: uuid
+        quantity:
+          type: number
+        average_cost_cents:
+          type: integer
+          format: int64
+        total_cost_basis_cents:
+          type: integer
+          format: int64
+        latest_price_cents:
+          type: [integer, "null"]
+          format: int64
+        latest_price_as_of:
+          type: [string, "null"]
+          format: date
+          description: Date of the price used (latest on or before as_of).
+        latest_price_source:
+          type: [string, "null"]
+        market_value_cents:
+          type: [integer, "null"]
+          format: int64
+          description: |
+            Null with na_reason=NO_MARKET_PRICE when no price exists on or
+            before as_of (2026-10-25). Never fabricate 0 for missing prices.
+        na_reason:
+          type: [string, "null"]
+        unrealized_pnl_cents:
+          type: [integer, "null"]
+          format: int64
+    Portfolio:
+      type: object
+      required: [as_of, market_value_cents, cost_basis_cents, unrealized_pnl_cents, positions]
+      properties:
+        as_of:
+          type: string
+          format: date
+        market_value_cents:
+          type: integer
+          format: int64
+        cost_basis_cents:
+          type: integer
+          format: int64
+        unrealized_pnl_cents:
+          type: integer
+          format: int64
+        realized_pnl_cents:
+          type: integer
+          format: int64
+        positions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Position"
+    PortfolioEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/Portfolio"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+
+    # ---------------------------------------------------------------------
+    # Metrics / reports / snapshots
+    # ---------------------------------------------------------------------
+    MetricResult:
+      type: object
+      required: [metric_id, metric_version, metric_name, unit, data_state, partial, missing_count]
+      properties:
+        metric_id:
+          $ref: "#/components/schemas/MetricId"
+        metric_version:
+          type: string
+        metric_name:
+          type: string
+        unit:
+          $ref: "#/components/schemas/MetricUnit"
+        value_cents:
+          type: [integer, "null"]
+          format: int64
+        value:
+          type: [number, "null"]
+        data_state:
+          $ref: "#/components/schemas/DataState"
+        as_of:
+          type: [string, "null"]
+          format: date
+        period:
+          type: [string, "null"]
+        partial:
+          type: boolean
+        missing_count:
+          type: integer
+          minimum: 0
+        estimate_count:
+          type: [integer, "null"]
+          minimum: 0
+        na_reason:
+          type: [string, "null"]
+        formula_version:
+          type: [string, "null"]
+        inputs:
+          type: object
+          additionalProperties: true
+    MetricEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/MetricResult"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    MetricBundleEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [metrics]
+          properties:
+            metrics:
+              type: array
+              items:
+                $ref: "#/components/schemas/MetricResult"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    SeriesPoint:
+      type: object
+      required: [period, value]
+      properties:
+        period:
+          type: string
+        value:
+          type: [number, "null"]
+        value_cents:
+          type: [integer, "null"]
+          format: int64
+        data_state:
+          $ref: "#/components/schemas/DataState"
+        mom:
+          type: ["null", object]
+          description: |
+            Server-derived month-over-month projection (2026-10-25 ext).
+            CNY metrics: relative change (v - ref) / |ref|. RATIO/MONTHS:
+            difference in the metric's own unit. null + na_reason when the
+            reference month is missing or the CNY reference is zero.
+          properties:
+            value:
+              type: [number, "null"]
+            value_cents:
+              type: [integer, "null"]
+              format: int64
+            reference_period:
+              type: string
+            na_reason:
+              type: [string, "null"]
+        yoy:
+          type: ["null", object]
+          description: Same projection against the same month last year.
+          properties:
+            value:
+              type: [number, "null"]
+            value_cents:
+              type: [integer, "null"]
+              format: int64
+            reference_period:
+              type: string
+            na_reason:
+              type: [string, "null"]
+    SeriesEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [metric_id, granularity, points]
+          properties:
+            metric_id:
+              $ref: "#/components/schemas/MetricId"
+            granularity:
+              type: string
+              enum: [day, week, month, quarter, year]
+            points:
+              type: array
+              items:
+                $ref: "#/components/schemas/SeriesPoint"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    ReportRow:
+      type: object
+      required: [label, amount_cents]
+      properties:
+        label:
+          type: string
+        account_id:
+          type: [string, "null"]
+          format: uuid
+        amount_cents:
+          type: integer
+          format: int64
+        data_state:
+          $ref: "#/components/schemas/DataState"
+    BalanceSheetReport:
+      type: object
+      required: [as_of, total_assets_cents, total_liabilities_cents, net_worth_cents, rows]
+      properties:
+        as_of:
+          type: string
+          format: date
+        total_assets_cents:
+          type: integer
+          format: int64
+        total_liabilities_cents:
+          type: integer
+          format: int64
+        net_worth_cents:
+          type: integer
+          format: int64
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReportRow"
+        excluded_assets:
+          type: array
+          items:
+            type: string
+    BalanceSheetEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/BalanceSheetReport"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    IncomeStatementReport:
+      type: object
+      required: [period, income_cents, essential_cents, discretionary_cents, financial_cost_cents, refund_reversal_cents, expense_cents, net_cents, rows]
+      properties:
+        period:
+          type: string
+        income_cents:
+          type: integer
+          format: int64
+        essential_cents:
+          type: integer
+          format: int64
+        discretionary_cents:
+          type: integer
+          format: int64
+        financial_cost_cents:
+          type: integer
+          format: int64
+        refund_reversal_cents:
+          type: integer
+          format: int64
+        expense_cents:
+          type: integer
+          format: int64
+        net_cents:
+          type: integer
+          format: int64
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReportRow"
+    IncomeStatementEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/IncomeStatementReport"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    CashFlowReport:
+      type: object
+      required: [from_date, to_date, operating_cents, investing_cents, financing_cents, net_cents]
+      properties:
+        from_date:
+          type: string
+          format: date
+        to_date:
+          type: string
+          format: date
+        operating_cents:
+          type: integer
+          format: int64
+        investing_cents:
+          type: integer
+          format: int64
+        financing_cents:
+          type: integer
+          format: int64
+        net_cents:
+          type: integer
+          format: int64
+        note:
+          type: string
+          description: Explains transfer/asset-exchange offset and PF-funded rent exclusion.
+    CashFlowEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/CashFlowReport"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    FinancialSnapshot:
+      type: object
+      required: [snapshot_id, as_of, total_assets_cents, total_liabilities_cents, net_worth_cents, formula_version]
+      properties:
+        snapshot_id:
+          type: string
+          format: uuid
+        as_of:
+          type: string
+          format: date
+        total_assets_cents:
+          type: integer
+          format: int64
+        total_liabilities_cents:
+          type: integer
+          format: int64
+        net_worth_cents:
+          type: integer
+          format: int64
+        cash_reserve_cents:
+          type: integer
+          format: int64
+        liquid_assets_cents:
+          type: integer
+          format: int64
+        formula_version:
+          type: string
+        inputs_hash:
+          type: string
+        computed_at:
+          type: string
+          format: date-time
+
+    # ---------------------------------------------------------------------
+    # Bootstrap / views / governance
+    # ---------------------------------------------------------------------
+    Profile:
+      type: object
+      description: |
+        Phase 1 demo profile. `profile_id` is a fixture identifier, not an
+        authentication identity; production identity always comes from `/me`.
+      properties:
+        profile_id:
+          type: string
+        display_name:
+          type: string
+        age:
+          type: [integer, "null"]
+        base_currency:
+          type: string
+        assumptions:
+          type: array
+          items:
+            type: string
+    BootstrapPayload:
+      type: object
+      required: [profile, accounts, categories, transactions, snapshots]
+      properties:
+        profile:
+          $ref: "#/components/schemas/Profile"
+        accounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Account"
+        categories:
+          type: array
+          items:
+            $ref: "#/components/schemas/Category"
+        transactions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Transaction"
+        instruments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Instrument"
+        positions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Position"
+        assets:
+          type: array
+          items:
+            $ref: "#/components/schemas/Asset"
+        asset_valuations:
+          type: array
+          items:
+            $ref: "#/components/schemas/AssetValuation"
+        snapshots:
+          type: array
+          items:
+            $ref: "#/components/schemas/FinancialSnapshot"
+        metrics:
+          type: array
+          items:
+            $ref: "#/components/schemas/MetricResult"
+    BootstrapEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/BootstrapPayload"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    ViewPayload:
+      type: object
+      required: [page, metrics]
+      properties:
+        page:
+          $ref: "#/components/schemas/Phase1Page"
+        metrics:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/MetricResult"
+        accounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Account"
+        transactions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Transaction"
+        categories:
+          type: array
+          items:
+            $ref: "#/components/schemas/Category"
+        assets:
+          type: array
+          items:
+            $ref: "#/components/schemas/Asset"
+        positions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Position"
+        snapshots:
+          type: array
+          items:
+            $ref: "#/components/schemas/FinancialSnapshot"
+        composition:
+          type: array
+          description: |
+            Named-group composition for the page (2026-10-25 ext):
+            income/expenses views break down by category, assets view by
+            server-defined asset/liability groups. Server-computed; shares
+            are decimals of the group total.
+          items:
+            type: object
+            required: [label, amount_cents, share, data_state]
+            properties:
+              label:
+                type: string
+              amount_cents:
+                type: integer
+                format: int64
+              share:
+                type: [number, "null"]
+              data_state:
+                $ref: "#/components/schemas/DataState"
+        summary:
+          type: ["null", object]
+          description: |
+            Transaction summary (2026-10-25 ext). On income/expenses pages
+            it summarizes the page period; on the transactions page it is
+            computed over the FULL filter scope (2026-10-26 ext: same
+            filters as GET /transactions, incl. from/to/type/status/q/
+            account/category/reconciliation/data_state) — never the
+            current page slice.
+          properties:
+            count:
+              type: integer
+            inflow_cents:
+              type: integer
+              format: int64
+            outflow_cents:
+              type: integer
+              format: int64
+            period:
+              type: [string, "null"]
+            scope:
+              type: ["null", object]
+              description: Echo of the filter scope the summary covers.
+              properties:
+                from:
+                  type: [string, "null"]
+                  format: date
+                to:
+                  type: [string, "null"]
+                  format: date
+                type:
+                  type: [string, "null"]
+                account_id:
+                  type: [string, "null"]
+                  format: uuid
+                category_code:
+                  type: [string, "null"]
+                status:
+                  type: [string, "null"]
+                reconciliation:
+                  type: [string, "null"]
+                data_state:
+                  type: [string, "null"]
+                q:
+                  type: [string, "null"]
+                first_month:
+                  type: [string, "null"]
+                last_month:
+                  type: [string, "null"]
+        income_stability:
+          type: ["null", object]
+          description: |
+            Recurring income and source concentration for the income view
+            (2026-10-25 ext). Concentration = top source share of the period.
+          properties:
+            period:
+              type: string
+            recurring_income_cents:
+              type: integer
+              format: int64
+            one_off_income_cents:
+              type: integer
+              format: int64
+            source_count:
+              type: integer
+            top_source_label:
+              type: [string, "null"]
+            top_source_amount_cents:
+              type: [integer, "null"]
+              format: int64
+            top_source_share:
+              type: [number, "null"]
+        expense_regularity:
+          type: ["null", object]
+          description: |
+            Fixed vs variable expenses and reimbursement tracking for the
+            expenses view (2026-10-25 ext). Fixed = recurring-marked
+            economic expenses; received = REFUND/REIMBURSEMENT inflows.
+          properties:
+            period:
+              type: string
+            fixed_expense_cents:
+              type: integer
+              format: int64
+            variable_expense_cents:
+              type: integer
+              format: int64
+            reimbursable_expense_cents:
+              type: integer
+              format: int64
+            reimbursement_received_cents:
+              type: integer
+              format: int64
+    ViewEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/ViewPayload"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    DataQualityCheck:
+      type: object
+      required: [check_id, pass, detail]
+      properties:
+        check_id:
+          type: string
+        pass:
+          type: boolean
+        detail:
+          type: string
+    DataQualityReport:
+      type: object
+      required: [run_at, pass, checks]
+      properties:
+        run_at:
+          type: string
+          format: date-time
+        pass:
+          type: boolean
+        checks:
+          type: array
+          items:
+            $ref: "#/components/schemas/DataQualityCheck"
+        fixture_normalization:
+          type: object
+          additionalProperties: true
+    DataQualityEnvelope:
+      type: object
+      required: [data]
+      properties:
+        data:
+          $ref: "#/components/schemas/DataQualityReport"
+        meta:
+          $ref: "#/components/schemas/ResponseMeta"
+    AuditLog:
+      type: object
+      required: [log_id, actor_type, operation_type, entity_type, entity_id, request_id, created_at]
+      properties:
+        log_id:
+          type: string
+          format: uuid
+        actor_type:
+          type: string
+          enum: [USER, AGENT, SYSTEM]
+        actor_id:
+          type: string
+        agent_id:
+          type: [string, "null"]
+        tool_name:
+          type: [string, "null"]
+        operation_type:
+          type: string
+        entity_type:
+          type: string
+        entity_id:
+          type: string
+        request_id:
+          type: string
+        approval_id:
+          type: [string, "null"]
+          format: uuid
+        before_state:
+          type: [object, "null"]
+          additionalProperties: true
+        after_state:
+          type: [object, "null"]
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+        hash:
+          type: string
